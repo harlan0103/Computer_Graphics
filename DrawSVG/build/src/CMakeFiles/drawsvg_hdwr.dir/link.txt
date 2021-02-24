@@ -1,0 +1,2 @@
+/Library/Developer/CommandLineTools/usr/bin/ar qc libdrawsvghdwr_osx.a  CMakeFiles/drawsvg_hdwr.dir/hardware/hardware_renderer.cpp.o
+/Library/Developer/CommandLineTools/usr/bin/ranlib libdrawsvghdwr_osx.a
