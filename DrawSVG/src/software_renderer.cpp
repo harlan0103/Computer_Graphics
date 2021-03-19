@@ -23,6 +23,7 @@ void SoftwareRendererImp::draw_svg( SVG& svg ) {
   // draw all elements
   for ( size_t i = 0; i < svg.elements.size(); ++i ) {
     draw_element(svg.elements[i]);
+    //transformation = svg_2_screen;
   }
 
   // draw canvas outline
@@ -67,11 +68,12 @@ void SoftwareRendererImp::set_render_target( unsigned char* render_target,
   // You may want to modify this for supersampling support
   
   // Resize super sample buffer and initialize it
-  int sampleBufferSize = sample_rate * sample_rate * 4 * width * height;
-  supersample_buffer.resize(sampleBufferSize);
+  supersample_w = sample_rate * width;
+  supersample_h = sample_rate * height;
+  supersample_buffer.resize(4 * supersample_w * supersample_h);
 
   // Set supersamplebuffer as default
-  memset(&supersample_buffer[0], 255, sampleBufferSize);
+  memset(&supersample_buffer[0], 255, 4 * supersample_w * supersample_h);
 
   this->render_target = render_target;
   this->target_w = width;
@@ -82,6 +84,8 @@ void SoftwareRendererImp::draw_element( SVGElement* element ) {
 
   // Task 5 (part 1):
   // Modify this to implement the transformation stack
+  Matrix3x3 oldTrans = transformation;
+  transformation = transformation * element->transform;
 
   switch(element->type) {
     case POINT:
@@ -111,7 +115,7 @@ void SoftwareRendererImp::draw_element( SVGElement* element ) {
     default:
       break;
   }
-
+  transformation = oldTrans;
 }
 
 
@@ -240,7 +244,7 @@ void SoftwareRendererImp::draw_group( Group& group ) {
 // below are all defined in screen space coordinates
 
 void SoftwareRendererImp::rasterize_point( float x, float y, Color color ) {
-
+  //std::cout << sample_rate << std::endl;
   // fill in the nearest pixel
   int sx = (int) floor(x);
   int sy = (int) floor(y);
@@ -249,11 +253,59 @@ void SoftwareRendererImp::rasterize_point( float x, float y, Color color ) {
   if ( sx < 0 || sx >= target_w ) return;
   if ( sy < 0 || sy >= target_h ) return;
 
-  // fill sample - NOT doing alpha blending!
-  render_target[4 * (sx + sy * target_w)    ] = (uint8_t) (color.r * 255);
-  render_target[4 * (sx + sy * target_w) + 1] = (uint8_t) (color.g * 255);
-  render_target[4 * (sx + sy * target_w) + 2] = (uint8_t) (color.b * 255);
-  render_target[4 * (sx + sy * target_w) + 3] = (uint8_t) (color.a * 255);
+  // Get premultiplied color
+  if (sample_rate == 1)
+  {
+    float r = render_target[4 * (sx + sy * target_w)    ] / 255.f;
+    float g = render_target[4 * (sx + sy * target_w) + 1] / 255.f;
+    float b = render_target[4 * (sx + sy * target_w) + 2] / 255.f;
+    float a = render_target[4 * (sx + sy * target_w) + 3] / 255.f;
+    Color premultipliedColor = Color(r, g, b, a);
+
+    // Modify input color
+    Color inputColor = Color(color.a * color.r, color.a * color.g, color.a * color.b, color.a);
+
+    // Calculate for premultiplied color
+    Color compositeColor = inputColor + (1 - inputColor.a) * premultipliedColor;
+
+    render_target[4 * (sx + sy * target_w)    ] = (uint8_t) (compositeColor.r / compositeColor.a * 255);
+    render_target[4 * (sx + sy * target_w) + 1] = (uint8_t) (compositeColor.g / compositeColor.a * 255);
+    render_target[4 * (sx + sy * target_w) + 2] = (uint8_t) (compositeColor.b / compositeColor.a * 255);
+    render_target[4 * (sx + sy * target_w) + 3] = (uint8_t) (compositeColor.a * 255);
+  }
+  else
+  {
+    // Add color into supersample buffer
+    int count = 0;                            // num of samples in one pixel
+    for (int countX = 0; countX < sample_rate; countX++)
+    {
+      for (int countY = 0; countY < sample_rate; countY++)
+      {
+        // Fill all supersample buffer position
+        int screenPointIdx = sample_rate * sample_rate * 4 * (sx + sy * target_w);
+        int supersampleIdx = count * 4;   // Each sample point will take 4 memory address
+        
+        float r = supersample_buffer[screenPointIdx + supersampleIdx + 0] / 255.f;
+        float g = supersample_buffer[screenPointIdx + supersampleIdx + 1] / 255.f;
+        float b = supersample_buffer[screenPointIdx + supersampleIdx + 2] / 255.f;
+        float a = supersample_buffer[screenPointIdx + supersampleIdx + 3] / 255.f;
+        Color premultipliedColor = Color(r, g, b, a);
+
+        // Modify input color
+        Color inputColor = Color(color.a * color.r, color.a * color.g, color.a * color.b, color.a);
+
+        // Calculate for premultiplied color
+        Color compositeColor = inputColor + (1 - inputColor.a) * premultipliedColor;
+
+        supersample_buffer[screenPointIdx + supersampleIdx + 0] = (uint8_t) (compositeColor.r / compositeColor.a * 255);
+        supersample_buffer[screenPointIdx + supersampleIdx + 1] = (uint8_t) (compositeColor.g / compositeColor.a * 255);
+        supersample_buffer[screenPointIdx + supersampleIdx + 2] = (uint8_t) (compositeColor.b / compositeColor.a * 255);
+        supersample_buffer[screenPointIdx + supersampleIdx + 3] = (uint8_t) (compositeColor.a * 255);
+
+        count++;
+      }
+    }
+  }
 }
 
 void SoftwareRendererImp::rasterize_line( float x0, float y0,
@@ -443,22 +495,36 @@ void SoftwareRendererImp::rasterize_triangle( float x0, float y0,
           int supersampleIdx = count * 4;   // Each sample point will take 4 memory address
 
           // Use right hand rule to check if sample point is inside of the triangle
-          if (vec1_x * u2 - vec1_y * u1 > 0 && vec2_x * v2 - vec2_y * v1 > 0 &&
-              vec3_x * w2 - vec3_y * w1 > 0)
+          if ((vec1_x * u2 - vec1_y * u1 > 0 && 
+              vec2_x * v2 - vec2_y * v1 > 0 &&
+              vec3_x * w2 - vec3_y * w1 > 0) ||
+              (u1 * vec1_y - u2 * vec1_x > 0 &&
+              v1 * vec2_y - v2 * vec2_x > 0 &&
+              w1 * vec3_y - w2 * vec3_x > 0))
           {
             if (sample_rate == 1)
             {
-              render_target[screenPointIdx + supersampleIdx + 0] = (uint8_t) (color.r * 255);
-              render_target[screenPointIdx + supersampleIdx + 1] = (uint8_t) (color.g * 255);
-              render_target[screenPointIdx + supersampleIdx + 2] = (uint8_t) (color.b * 255);
-              render_target[screenPointIdx + supersampleIdx + 3] = (uint8_t) (color.a * 255);
+              rasterize_point(x, y, color);
             }
             else
             {
-              supersample_buffer[screenPointIdx + supersampleIdx + 0] = (uint8_t) (color.r * 255);
-              supersample_buffer[screenPointIdx + supersampleIdx + 1] = (uint8_t) (color.g * 255);
-              supersample_buffer[screenPointIdx + supersampleIdx + 2] = (uint8_t) (color.b * 255);
-              supersample_buffer[screenPointIdx + supersampleIdx + 3] = (uint8_t) (color.a * 255);
+              // Compute composite color
+              float r = supersample_buffer[screenPointIdx + supersampleIdx + 0] / 255.f;
+              float g = supersample_buffer[screenPointIdx + supersampleIdx + 1] / 255.f;
+              float b = supersample_buffer[screenPointIdx + supersampleIdx + 2] / 255.f;
+              float a = supersample_buffer[screenPointIdx + supersampleIdx + 3] / 255.f;
+              Color premultipliedColor = Color(r, g, b, a);
+
+              // Modify input color
+              Color inputColor = Color(color.a * color.r, color.a * color.g, color.a * color.b, color.a);
+
+              // Calculate for premultiplied color
+              Color compositeColor = inputColor + (1 - inputColor.a) * premultipliedColor;
+
+              supersample_buffer[screenPointIdx + supersampleIdx + 0] = (uint8_t) (compositeColor.r / compositeColor.a * 255);
+              supersample_buffer[screenPointIdx + supersampleIdx + 1] = (uint8_t) (compositeColor.g / compositeColor.a * 255);
+              supersample_buffer[screenPointIdx + supersampleIdx + 2] = (uint8_t) (compositeColor.b / compositeColor.a * 255);
+              supersample_buffer[screenPointIdx + supersampleIdx + 3] = (uint8_t) (compositeColor.a * 255);
             }
           }
           count++;
@@ -473,6 +539,22 @@ void SoftwareRendererImp::rasterize_image( float x0, float y0,
                                            Texture& tex ) {
   // Task 6: 
   // Implement image rasterization
+  float imageWidth = x1 - x0;
+  float imageHeight = y1 - y0;
+
+  for (float x = floor(x0) + 0.5; x <= x1; x++)
+  {
+    for (float y = floor(y0) + 0.5; y <= y1; y++)
+    {
+      float u = (x - x0) / imageWidth;
+      float v = (y - y0) / imageHeight;
+      //Color color = sampler->sample_nearest(tex, u, v, 0);
+      //Color color = sampler->sample_bilinear(tex, u, v, 0);
+
+      Color color = sampler->sample_trilinear(tex, u, v, imageWidth, imageHeight);
+      rasterize_point(x, y, color);
+    }
+  }
 
 }
 
@@ -488,7 +570,7 @@ void SoftwareRendererImp::resolve( void ) {
     return;
   }
 
-  // Calculate average color at each pixel point
+  // Now need to calculate the average color value for supersample buffer
   for (int x = 0; x < target_w; x++)
   {
     for (int y = 0; y < target_h; y++)
@@ -497,15 +579,15 @@ void SoftwareRendererImp::resolve( void ) {
       int count = 0;
       for (int xSample = 0; xSample < sample_rate; xSample++)
       {
-          for (int ySample = 0; ySample < sample_rate; ySample++)
-          {
-            r += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 0];
-            g += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 1];
-            b += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 2];
-            a += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 3];
+        for (int ySample = 0; ySample < sample_rate; ySample++)
+        {
+          r += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 0];
+          g += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 1];
+          b += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 2];
+          a += supersample_buffer[sample_rate * sample_rate * 4 * (x + y * target_w) + count * 4 + 3];
 
-            count++;
-          }
+          count++;
+        }
       }
 
       // Calculate final color
@@ -514,44 +596,17 @@ void SoftwareRendererImp::resolve( void ) {
       b = b / pow(sample_rate, 2);
       a = a / pow(sample_rate, 2);
 
-      // If render_target has color value at this point
-      if (r != 255)
-      {
-        if (render_target[4 * (x + y * target_w)    ] != 255)
-        {
-          r = (r + render_target[4 * (x + y * target_w)    ]) / 2;
-        }
-        render_target[4 * (x + y * target_w)    ] = (uint8_t) r;
-      }
-
-      if (g != 255)
-      {
-        if (render_target[4 * (x + y * target_w) + 1] != 255)
-        {
-          g = (g + render_target[4 * (x + y * target_w) + 1]) / 2;
-        }
-        render_target[4 * (x + y * target_w) + 1] = (uint8_t) g;
-      }
-
-      if (b != 255)
-      {
-        if (render_target[4 * (x + y * target_w) + 2] != 255)
-        {
-          b = (b + render_target[4 * (x + y * target_w) + 2]) / 2;
-        }
-        render_target[4 * (x + y * target_w) + 2] = (uint8_t) b;
-      }
-
-      if (a != 255)
-      { 
-        if (render_target[4 * (x + y * target_w) + 3] != 255)
-        {
-          a = (a + render_target[4 * (x + y * target_w) + 3]) / 2;
-        }
-        render_target[4 * (x + y * target_w) + 3] = (uint8_t) a;
-      }
+      // Push back to render target 
+      render_target[4 * (x + y * target_w)    ] = (uint8_t) r;
+      render_target[4 * (x + y * target_w) + 1] = (uint8_t) g;
+      render_target[4 * (x + y * target_w) + 2] = (uint8_t) b;
+      render_target[4 * (x + y * target_w) + 3] = (uint8_t) a;
     }
   }
+
+  // Clean up supersample buffer
+  memset(&supersample_buffer[0], 255, 4 * supersample_w * supersample_h);
+
   return;
 }
 
